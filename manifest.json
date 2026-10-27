@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "techspawn.tips",
+  "name": "Tip of the Day",
+  "version": "1.1.0",
+  "author": "Raj Shimpi",
+  "license": "MIT",
+  "description": "One short tip a day about Omarchy, Hyprland windows, the terminal, tmux, Neovim and git, mixed with tips made from your own keybindings. Arrives once a day at the time you choose, catches up if the laptop was asleep, never repeats until you have seen them all, and waits while you are in a meeting. Click the notification for another tip, or add the bar widget to flip through them.",
+  "repository": "https://github.com/RajShimpi/omarchy-tips",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": { "service": "Service.qml", "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Tip of the Day",
+    "description": "Today's tip, with previous and next",
+    "category": "Info",
+    "aliases": ["tip", "tips", "tip of the day", "learn"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Tip of the day: a short tip about Omarchy, the terminal, git and friends.
+
+  tip next          JSON of a tip not shown yet (it becomes the current tip)
+  tip prev          JSON of the tip shown before the current one
+  tip current       JSON of the current tip (picks one if there is none)
+  tip daily         once a day at the set time: show a tip as a notification.
+                    Run every minute by the service; catches up after sleep or shutdown.
+  tip notify-next   show another tip as a notification (clicking a tip runs this)
+  tip count         how many tips there are and how many you have seen
+  tip edit          create ~/.config/omarchy/tips.json if missing and open it
+  tip status        what the service knows, for troubleshooting
+
+Tips come from ../tips.json plus your own keybindings (`omarchy menu keybindings --print`).
+No tip repeats until all have been shown. Settings: ~/.config/omarchy/tips.json
+(time, notify, shortcuts, topics, quietWhenBusy). State: ~/.local/state/omarchy/tips.json.
+OMARCHY_NO_NOTIFY=1 prints notifications to stderr instead of sending them.
+"""
+import fcntl, json, os, random, re, subprocess, sys, tempfile, time
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SELF = os.path.abspath(__file__)
+HOME = os.path.expanduser("~")
+CONF = os.path.join(HOME, ".config/omarchy/tips.json")
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "omarchy/tips.json")
+APP_NAME = "Tip of the Day"   # not omarchy-action, so Do Not Disturb applies
+GLYPH = "\U000F06E8"          # md-lightbulb_on
+DRY = os.environ.get("OMARCHY_NO_NOTIFY") == "1"
+DEFAULTS = {"time": "09:00", "notify": True, "shortcuts": True, "topics": [], "quietWhenBusy": True}
+HISTORY = 50
+
+
+# ---------- settings and state ----------
+
+def _hhmm(v):
+    m = re.fullmatch(r"\s*(\d{1,2}):?(\d{2})\s*", str(v or ""))
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        return None
+    return int(m.group(1)) * 60 + int(m.group(2))
+
+
+def _bool(v, default):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() not in ("false", "0", "no", "off", "")
+    return default if v is None else bool(v)
+
+
+def settings():
+    s = dict(DEFAULTS)
+    try:
+        with open(CONF) as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            s.update({k: v for k, v in user.items() if v is not None})
+    except (OSError, ValueError):
+        pass
+    s["timeMin"] = _hhmm(s["time"])
+    if s["timeMin"] is None:
+        s["time"], s["timeMin"] = DEFAULTS["time"], _hhmm(DEFAULTS["time"])
+    for k in ("notify", "shortcuts", "quietWhenBusy"):
+        s[k] = _bool(s[k], DEFAULTS[k])
+    topics = s["topics"] if isinstance(s["topics"], list) else [s["topics"]] if isinstance(s["topics"], str) else []
+    s["topics"] = [str(t).strip().lower() for t in topics if str(t).strip()]
+    return s
+
+
+def load():
+    try:
+        with open(STATE) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    if not isinstance(st, dict):
+        st = {}
+    st["seen"] = [t for t in st.get("seen", []) if isinstance(t, str)]
+    st["history"] = [t for t in st.get("history", []) if isinstance(t, dict) and isinstance(t.get("tip"), str)]
+    st["lastDaily"] = st.get("lastDaily") if isinstance(st.get("lastDaily"), str) else ""
+    pos = st.get("pos")
+    st["pos"] = pos if isinstance(pos, int) and 0 <= pos < len(st["history"]) else len(st["history"]) - 1
+    return st
+
+
+def save(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE), prefix=".tips-", suffix=".tmp")
+    os.fchmod(fd, 0o644)   # mkstemp makes it private; this is an ordinary user file
+    with os.fdopen(fd, "w") as f:
+        json.dump(st, f, ensure_ascii=False)
+    os.replace(tmp, STATE)
+
+
+class locked:
+    """The service, every bar panel and Search-style launchers share one state file."""
+    def __enter__(self):
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        self.f = open(STATE + ".lock", "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+
+
+# ---------- tips ----------
+
+KEYS = {"SUPER": "Super", "SHIFT": "Shift", "CTRL": "Ctrl", "ALT": "Alt", "RETURN": "Return", "SPACE": "Space",
+        "ESCAPE": "Esc", "BACKSPACE": "Backspace", "TAB": "Tab", "PRINT": "Print", "COMMA": "Comma", "PERIOD": "Period",
+        "SLASH": "Slash", "MINUS": "Minus", "EQUAL": "Equal", "BRACKETLEFT": "[", "BRACKETRIGHT": "]", "LEFT": "Left",
+        "RIGHT": "Right", "UP": "Up", "DOWN": "Down", "DELETE": "Delete", "HOME": "Home"}
+
+
+def pretty_keys(keys):
+    """"SUPER SHIFT + RETURN" -> "Super + Shift + Return"."""
+    parts = []
+    for side in keys.split(" + "):
+        for word in side.split():
+            parts.append(KEYS.get(word.upper(), word.upper() if len(word) == 1 else word.capitalize()))
+    return " + ".join(parts)
+
+
+def shortcuts():
+    """Your real keybindings, one tip each. Leaves out media keys, mouse wheel
+    binds, numbered series like "Switch to workspace 1..10" and the fine-step
+    variants of resize binds."""
+    try:
+        out = subprocess.run(["omarchy", "menu", "keybindings", "--print"], capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    tips, keys_seen, descs_seen = [], set(), set()
+    for line in out.splitlines():
+        m = re.match(r"^(.+?)\s+→\s+(.+)$", line.strip())
+        if not m:
+            continue
+        keys, desc = re.sub(r"\s+", " ", m.group(1).strip()), m.group(2).strip()
+        if re.search(r"XF86|mouse_(up|down)|MOUSE BUTTON|code:", keys, re.I) or re.search(r"\s\d+$| a little$| a lot$|precise$", desc):
+            continue
+        if keys in keys_seen or desc.lower() in descs_seen:
+            continue
+        keys_seen.add(keys); descs_seen.add(desc.lower())
+        tips.append({"topic": "Shortcut", "tip": f"{pretty_keys(keys)}  →  {desc}"})
+    return tips
+
+
+def pool(s):
+    try:
+        with open(os.path.join(HERE, "tips.json")) as f:
+            base = [t for t in json.load(f) if isinstance(t, dict) and t.get("tip")]
+    except (OSError, ValueError):
+        base = []
+    tips = base + (shortcuts() if s["shortcuts"] else [])
+    if s["topics"]:
+        tips = [t for t in tips if t.get("topic", "").lower() in s["topics"]] or tips
+    return tips
+
+
+def pick(st, s):
+    """A tip not shown yet. Shortcuts and written tips take turns. When every tip
+    has been shown the cycle starts again, never with the one just shown."""
+    tips = pool(s)
+    if not tips:
+        return None
+    texts = {t["tip"] for t in tips}
+    seen = [t for t in st["seen"] if t in texts]   # tips that were removed don't count
+    last = st["history"][-1] if st["history"] else None
+    unseen = [t for t in tips if t["tip"] not in set(seen)]
+    if not unseen:
+        seen = []
+        unseen = [t for t in tips if not last or t["tip"] != last["tip"]] or tips
+    want_shortcut = not (last and last.get("topic") == "Shortcut")
+    preferred = [t for t in unseen if (t.get("topic") == "Shortcut") == want_shortcut] or unseen
+    t = dict(random.choice(preferred))
+    seen.append(t["tip"])
+    st["seen"] = seen
+    st["history"] = (st["history"] + [{"topic": t.get("topic", "Tip"), "tip": t["tip"], "at": int(time.time())}])[-HISTORY:]
+    st["pos"] = len(st["history"]) - 1
+    return out(st, len(tips))
+
+
+def out(st, total=None):
+    if not st["history"]:
+        return None
+    cur = st["history"][st["pos"]]
+    d = {"topic": cur.get("topic", "Tip"), "tip": cur["tip"], "at": cur.get("at", 0),
+         "index": st["pos"], "history": len(st["history"]), "seen": len(st["seen"])}
+    if total is not None:
+        d["total"] = total
+    return d
+
+
+# ---------- notifications ----------
+
+def busy():
+    """In a meeting or sharing the screen, judged by window titles."""
+    try:
+        o = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return bool(re.search(r'"title":\s*"[^"]*(Meeting|Call with|Sharing|Huddle|Meet - )', o, re.I))
+
+
+def esc(text):
+    # The notification body is markup (StyledText); a tip is plain text.
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def notify(t, title):
+    cmd = ["omarchy-notification-send", "--app-name", APP_NAME, "-g", GLYPH, f"{title} · {t['topic']}", esc(t["tip"]),
+           "--exec", SELF, "notify-next"]
+    if DRY:
+        print("notify: " + json.dumps({"title": cmd[5], "body": cmd[6], "click": cmd[8:]}, ensure_ascii=False), file=sys.stderr)
+        return
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def minute_of_day():
+    lt = time.localtime()
+    return lt.tm_hour * 60 + lt.tm_min
+
+
+def daily(s):
+    """Today's tip, once, at or after the set time. Returns why it did or didn't."""
+    today = time.strftime("%Y-%m-%d")
+    with locked():
+        st = load()
+        if st["lastDaily"] == today:
+            return "already shown today"
+        if minute_of_day() < s["timeMin"]:
+            return "not time yet"
+        if not s["notify"]:
+            return "notify is off"
+        if s["quietWhenBusy"] and busy():
+            return "in a meeting, trying again in a minute"
+        t = pick(st, s)
+        st["lastDaily"] = today
+        save(st)
+    if t:
+        notify(t, "Tip of the day")
+    return "shown"
+
+
+DEFAULT_CONF = {"time": "09:00", "notify": True, "shortcuts": True, "topics": [], "quietWhenBusy": True}
+
+
+def main(a):
+    cmd = a[0] if a else ""
+    s = settings()
+    if cmd in ("next", "prev", "current"):
+        with locked():
+            st = load()
+            if cmd == "next" and st["pos"] < len(st["history"]) - 1:
+                st["pos"] += 1                      # forward again after going back
+                t = out(st)
+            elif cmd == "next" or (cmd == "current" and not st["history"]):
+                t = pick(st, s)
+            elif cmd == "prev":
+                st["pos"] = max(0, st["pos"] - 1)
+                t = out(st)
+            else:
+                t = out(st)
+            save(st)
+        print(json.dumps(t, ensure_ascii=False))
+    elif cmd == "daily":
+        why = daily(s)
+        if DRY:
+            print(json.dumps({"daily": why}), file=sys.stderr)
+    elif cmd == "notify-next":
+        with locked():
+            st = load()
+            t = pick(st, s)
+            save(st)
+        if t:
+            notify(t, "Another tip")
+    elif cmd == "count":
+        st, tips = load(), pool(s)
+        texts = {t["tip"] for t in tips}
+        print(json.dumps({"tips": len(tips), "seen": len([t for t in st["seen"] if t in texts])}))
+    elif cmd == "edit":
+        if not os.path.exists(CONF):
+            os.makedirs(os.path.dirname(CONF), exist_ok=True)
+            with open(CONF, "w") as f:
+                json.dump(DEFAULT_CONF, f, indent=2)
+                f.write("\n")
+        os.execvp("omarchy-launch-editor", ["omarchy-launch-editor", CONF])
+    elif cmd == "status":
+        st = load()
+        print(json.dumps({"settings": {k: v for k, v in s.items() if k != "timeMin"}, "lastDaily": st["lastDaily"],
+                          "dueToday": st["lastDaily"] != time.strftime("%Y-%m-%d") and minute_of_day() >= s["timeMin"],
+                          "seen": len(st["seen"]), "history": len(st["history"]), "current": out(st)}, indent=2,
+                         ensure_ascii=False))
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
