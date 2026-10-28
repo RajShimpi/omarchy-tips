@@ -106,6 +106,7 @@ Panel {
             spacing: Style.space(14)
             anchors.verticalCenter: parent.verticalCenter
             Text {
+              textFormat: Text.PlainText
               text: root.glyphTip
               color: root.fg; font.family: root.font; font.pixelSize: Style.font.display
               anchors.verticalCenter: parent.verticalCenter
@@ -113,8 +114,9 @@ Panel {
             Column {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(2)
-              Text { text: "Tip of the day"; color: root.fg; font.family: root.font; font.pixelSize: Style.font.title; font.bold: true }
+              Text { textFormat: Text.PlainText; text: "Tip of the day"; color: root.fg; font.family: root.font; font.pixelSize: Style.font.title; font.bold: true }
               Text {
+                textFormat: Text.PlainText
                 text: (root.tip ? root.tip.topic : "No tip yet").toUpperCase()
                 color: Qt.darker(root.fg, 1.4)
                 font.family: root.font; font.pixelSize: Style.font.caption; font.bold: true; font.letterSpacing: 1.2
@@ -151,6 +153,7 @@ Panel {
           width: parent.width
           implicitHeight: navRow.implicitHeight
           Text {
+            textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
             width: parent.width - navRow.width - Style.space(10)

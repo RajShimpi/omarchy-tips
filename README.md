@@ -112,7 +112,10 @@ When the bar panel is open:
 - State: `~/.local/state/omarchy/tips.json` (`$XDG_STATE_HOME` if set)
   holds the tips you have seen, the last 50 shown, and the day the last
   daily tip went out. A file lock keeps the service and the panels from
-  writing it at the same time.
+  writing it at the same time. Only you can read it (`0600`).
+- Shortcut tips use only bindings that have a description. When a binding
+  has none, Omarchy shows the command itself, which can hold private paths
+  or arguments, so it is skipped.
 - It makes no network requests and sends nothing anywhere.
 
 ## License

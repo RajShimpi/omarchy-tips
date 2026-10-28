@@ -74,8 +74,9 @@ def load():
         st = {}
     if not isinstance(st, dict):
         st = {}
-    st["seen"] = [t for t in st.get("seen", []) if isinstance(t, str)]
-    st["history"] = [t for t in st.get("history", []) if isinstance(t, dict) and isinstance(t.get("tip"), str)]
+    st["seen"] = [t for t in st.get("seen", []) if isinstance(t, str) and not raw_shortcut(t)]
+    st["history"] = [t for t in st.get("history", []) if isinstance(t, dict) and isinstance(t.get("tip"), str)
+                     and not raw_shortcut(t["tip"])]
     st["lastDaily"] = st.get("lastDaily") if isinstance(st.get("lastDaily"), str) else ""
     pos = st.get("pos")
     st["pos"] = pos if isinstance(pos, int) and 0 <= pos < len(st["history"]) else len(st["history"]) - 1
@@ -84,8 +85,7 @@ def load():
 
 def save(st):
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE), prefix=".tips-", suffix=".tmp")
-    os.fchmod(fd, 0o644)   # mkstemp makes it private; this is an ordinary user file
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE), prefix=".tips-", suffix=".tmp")  # 0600: it holds your shortcuts
     with os.fdopen(fd, "w") as f:
         json.dump(st, f, ensure_ascii=False)
     os.replace(tmp, STATE)
@@ -120,10 +120,22 @@ def pretty_keys(keys):
     return " + ".join(parts)
 
 
+# Omarchy prints the bound command itself when a binding has no description
+# ("omarchy-launch-browser --private", "~/bin/vpn up", "FOO=1 app", "workspace,5").
+# A command can hold private paths or arguments, so those never become tips.
+RAW_COMMAND = re.compile(r"^(?:[a-z/~$.]|\S*[=,])")
+
+
+def raw_shortcut(tip):
+    """A shortcut tip saved by an older version from a binding without a description."""
+    parts = tip.split("  →  ", 1)
+    return len(parts) == 2 and bool(RAW_COMMAND.match(parts[1]))
+
+
 def shortcuts():
-    """Your real keybindings, one tip each. Leaves out media keys, mouse wheel
-    binds, numbered series like "Switch to workspace 1..10" and the fine-step
-    variants of resize binds."""
+    """Your real keybindings, one tip each. Leaves out bindings without a
+    description, media keys, mouse wheel binds, numbered series like "Switch to
+    workspace 1..10" and the fine-step variants of resize binds."""
     try:
         out = subprocess.run(["omarchy", "menu", "keybindings", "--print"], capture_output=True, text=True, timeout=15).stdout
     except (OSError, subprocess.TimeoutExpired):
@@ -134,6 +146,8 @@ def shortcuts():
         if not m:
             continue
         keys, desc = re.sub(r"\s+", " ", m.group(1).strip()), m.group(2).strip()
+        if RAW_COMMAND.match(desc):
+            continue
         if re.search(r"XF86|mouse_(up|down)|MOUSE BUTTON|code:", keys, re.I) or re.search(r"\s\d+$| a little$| a lot$|precise$", desc):
             continue
         if keys in keys_seen or desc.lower() in descs_seen:
